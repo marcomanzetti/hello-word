@@ -1,22 +1,24 @@
 /*
  * Centralina faretti moto con MEMORIA allo spegnimento
  * ----------------------------------------------------
+ * Per faretti a 3 funzioni: DRL, ANABBAGLIANTE, ABBAGLIANTE.
  * Sostituisce una centralina tipo "JS1 / JPAD" che a ogni giro di chiave
  * torna a "spento", mantenendo le stesse funzioni:
  *   - accensione / spegnimento
- *   - luminosita' regolabile (PWM)
+ *   - scelta della luce: DRL -> anabbagliante -> abbagliante
+ *   - luminosita' regolabile (PWM), memorizzata separatamente per ogni luce
  *   - strobo
- *   - (opzionale) due colori: bianco / giallo / entrambi
+ *   - (facoltativo) abbagliante sincronizzato con l'abbagliante della moto
  *
- * Tutto (acceso/spento, modalita', luminosita', colore) viene salvato in
- * EEPROM e ripristinato a ogni accensione della moto.
+ * Tutto (acceso/spento, luce, strobo, luminosita') viene salvato in EEPROM
+ * e ripristinato a ogni accensione della moto.
  *
  * UN SOLO PULSANTE al manubrio:
- *   1 click             -> accende / spegne
- *   2 click             -> fisso <-> strobo
- *   3 click             -> colore: bianco -> giallo -> entrambi (se 2 canali)
- *   tieni premuto       -> luminosita' a rampa (rilascia quando ti piace;
- *                          alla pressione successiva la rampa va al contrario)
+ *   1 click        -> accende / spegne (riparte dall'ultima luce usata)
+ *   2 click        -> luce successiva: DRL -> anabbagliante -> abbagliante
+ *   3 click        -> strobo si' / no
+ *   tieni premuto  -> luminosita' della luce attuale a rampa (rilascia quando
+ *                     ti piace; alla pressione successiva va al contrario)
  *
  * Scheda: Arduino Nano / Uno / Pro Mini 5V (ATmega328P).
  * Uscite: MOSFET P-channel lato positivo (vedi schema.svg e README.md).
@@ -28,15 +30,22 @@
 
 // Pin
 const uint8_t PIN_PULSANTE = 2;   // pulsante verso GND (pull-up interno)
-const uint8_t PIN_CANALE_A = 9;   // PWM -> faretti bianchi (o unico colore)
-const uint8_t PIN_CANALE_B = 10;  // PWM -> faretti gialli
+const uint8_t PIN_ABB_MOTO = 4;   // ingresso abbagliante moto (PC817, attivo basso)
 const uint8_t PIN_SPIA     = 5;   // PWM -> LED spia (facoltativo)
+const uint8_t PIN_DRL      = 6;   // PWM -> + DRL faretti
+const uint8_t PIN_ANAB     = 9;   // PWM -> + anabbagliante faretti
+const uint8_t PIN_ABB      = 10;  // PWM -> + abbagliante faretti
 
-// 1 = faretti di un solo colore, 2 = faretti bianco + giallo (3 fili)
-const uint8_t NUM_CANALI = 2;
+// Ingresso abbagliante moto: con l'abbagliante della moto acceso (o il
+// lampeggio), i faretti accesi passano in abbagliante al 100%.
+// Se non colleghi l'optoisolatore lascia pure true: l'ingresso resta inattivo.
+const bool USA_ABB_MOTO = true;
 
-// Luminosita' (livello "percepito"; l'uscita PWM e' corretta in modo che
-// la rampa sembri uniforme all'occhio)
+// Combinazioni delle luci (dipendono da come sono fatti i tuoi faretti)
+const bool DRL_CON_FARI = true;   // il DRL resta acceso anche in anabb./abbagl.
+const bool ANAB_CON_ABB = true;   // l'anabbagliante resta acceso con l'abbagliante
+
+// Luminosita' (livello "percepito", con correzione per l'occhio)
 const uint8_t LUM_MIN = 40;           // circa 2,5% di potenza
 const uint8_t LUM_MAX = 255;          // 100%
 const unsigned long RAMPA_MS = 2500;  // tempo per passare da minimo a massimo
@@ -44,8 +53,8 @@ const unsigned long RAMPA_MS = 2500;  // tempo per passare da minimo a massimo
 // Strobo: durate in ms alternate ACCESO, SPENTO, ACCESO, SPENTO...
 const uint16_t SEQUENZA_STROBO[] = { 40, 60, 40, 60, 40, 500 };
 
-// Se false, all'accensione della moto lo strobo riparte come luce fissa
-// (la luminosita' e il colore restano comunque memorizzati).
+// Se false, all'accensione della moto lo strobo riparte spento
+// (luce e luminosita' restano comunque memorizzate).
 const bool RIPRISTINA_STROBO = true;
 
 // Tempi (ms)
@@ -58,14 +67,13 @@ const unsigned long RITARDO_SALVA   = 2000; // salva dopo 2 s senza modifiche
 
 // ===================== STATO E MEMORIA =====================
 
-enum : uint8_t { FISSO = 0, STROBO = 1 };
-enum : uint8_t { BIANCO = 0, GIALLO = 1, ENTRAMBI = 2 };
+enum : uint8_t { DRL = 0, ANAB = 1, ABB = 2, NUM_LUCI = 3 };
 
 struct Stato {
   uint8_t acceso;
-  uint8_t modalita;
-  uint8_t luminosita;
-  uint8_t colore;
+  uint8_t luce;                 // DRL / ANAB / ABB
+  uint8_t strobo;
+  uint8_t lum[NUM_LUCI];        // luminosita' di ogni luce
 };
 
 struct Memoria {
@@ -75,18 +83,22 @@ struct Memoria {
 };
 
 const uint16_t INDIRIZZO_EEPROM = 0;
-const uint16_t FIRMA = 0xFA71;
+const uint16_t FIRMA = 0xFA72;
 
-Stato stato   = { 0, FISSO, LUM_MAX, BIANCO };
+Stato stato   = { 0, ANAB, 0, { LUM_MAX, LUM_MAX, LUM_MAX } };
 Stato salvato = stato;
 
 uint8_t calcolaControllo(const Stato &s) {
-  return 0xA5 ^ s.acceso ^ (s.modalita << 1) ^ s.luminosita ^ (s.colore << 3);
+  const uint8_t *p = (const uint8_t *)&s;
+  uint8_t c = 0xA5;
+  for (uint8_t i = 0; i < sizeof(Stato); i++) c = (uint8_t)((c << 1) | (c >> 7)) ^ p[i];
+  return c;
 }
 
 bool statoValido(const Stato &s) {
-  return s.acceso <= 1 && s.modalita <= STROBO &&
-         s.luminosita >= LUM_MIN && s.colore <= ENTRAMBI;
+  if (s.acceso > 1 || s.luce >= NUM_LUCI || s.strobo > 1) return false;
+  for (uint8_t i = 0; i < NUM_LUCI; i++) if (s.lum[i] < LUM_MIN) return false;
+  return true;
 }
 
 void caricaStato() {
@@ -96,7 +108,6 @@ void caricaStato() {
       statoValido(m.stato)) {
     stato = m.stato;
   }
-  if (NUM_CANALI < 2) stato.colore = BIANCO;
   salvato = stato;
 }
 
@@ -107,8 +118,7 @@ void salvaStato() {
 }
 
 bool statoCambiato() {
-  return stato.acceso != salvato.acceso || stato.modalita != salvato.modalita ||
-         stato.luminosita != salvato.luminosita || stato.colore != salvato.colore;
+  return memcmp(&stato, &salvato, sizeof(Stato)) != 0;
 }
 
 // ===================== USCITE =====================
@@ -116,6 +126,7 @@ bool statoCambiato() {
 unsigned long ultimoCambio = 0;
 unsigned long inizioDissolvenza = 0;
 unsigned long inizioStrobo = 0;
+bool abbMoto = false;           // abbagliante della moto acceso (filtrato)
 
 void segnaModifica(unsigned long ora) { ultimoCambio = ora; }
 
@@ -142,18 +153,48 @@ bool faseStroboAccesa(unsigned long ora) {
 }
 
 void aggiornaUscite(unsigned long ora) {
+  uint8_t luce = stato.luce;
+  uint8_t livello = stato.lum[luce];
+  bool strobo = stato.strobo;
+
+  // Abbagliante della moto acceso -> abbagliante pieno, niente strobo
+  if (stato.acceso && abbMoto) {
+    luce = ABB;
+    livello = LUM_MAX;
+    strobo = false;
+  }
+
   uint8_t pwm = 0;
   if (stato.acceso) {
-    pwm = pwmDaLivello(stato.luminosita);
+    pwm = pwmDaLivello(livello);
     unsigned long trascorso = ora - inizioDissolvenza;
     if (trascorso < DISSOLVENZA) pwm = (uint32_t)pwm * trascorso / DISSOLVENZA;
-    if (stato.modalita == STROBO && !faseStroboAccesa(ora)) pwm = 0;
+    if (strobo && !faseStroboAccesa(ora)) pwm = 0;
   }
-  bool usaA = (NUM_CANALI < 2) || stato.colore != GIALLO;
-  bool usaB = (NUM_CANALI >= 2) && stato.colore != BIANCO;
-  analogWrite(PIN_CANALE_A, usaA ? pwm : 0);
-  analogWrite(PIN_CANALE_B, usaB ? pwm : 0);
-  analogWrite(PIN_SPIA, pwm ? 40 : 0);   // spia tenue quando i faretti sono accesi
+
+  bool drl  = (luce == DRL) || DRL_CON_FARI;
+  bool anab = (luce == ANAB) || (luce == ABB && ANAB_CON_ABB);
+  bool abb  = (luce == ABB);
+
+  analogWrite(PIN_DRL,  drl  ? pwm : 0);
+  analogWrite(PIN_ANAB, anab ? pwm : 0);
+  analogWrite(PIN_ABB,  abb  ? pwm : 0);
+  analogWrite(PIN_SPIA, stato.acceso ? 40 : 0);  // spia tenue a faretti accesi
+}
+
+// ===================== INGRESSO ABBAGLIANTE MOTO =====================
+
+bool letturaAbbPrec = false;
+unsigned long tempoLetturaAbb = 0;
+
+void gestisciAbbMoto(unsigned long ora) {
+  if (!USA_ABB_MOTO) return;
+  bool lettura = (digitalRead(PIN_ABB_MOTO) == LOW);
+  if (lettura != letturaAbbPrec) {
+    letturaAbbPrec = lettura;
+    tempoLetturaAbb = ora;
+  }
+  if ((ora - tempoLetturaAbb) >= DEBOUNCE) abbMoto = lettura;
 }
 
 // ===================== PULSANTE =====================
@@ -177,10 +218,10 @@ void eseguiClick(uint8_t n, unsigned long ora) {
   } else if (!stato.acceso) {
     return;                       // doppio/triplo click a luci spente: niente
   } else if (n == 2) {
-    stato.modalita = (stato.modalita == FISSO) ? STROBO : FISSO;
+    stato.luce = (stato.luce + 1) % NUM_LUCI;
+  } else {
+    stato.strobo = !stato.strobo;
     inizioStrobo = ora;
-  } else if (NUM_CANALI >= 2) {
-    stato.colore = (stato.colore + 1) % 3;
   }
   segnaModifica(ora);
 }
@@ -205,22 +246,24 @@ void gestisciPulsante(unsigned long ora) {
     }
   }
 
-  // Pressione lunga a luci accese -> regolazione luminosita'
+  uint8_t &lum = stato.lum[stato.luce];
+
+  // Pressione lunga a luci accese -> regolazione luminosita' della luce attuale
   if (premuto && !inRampa && stato.acceso &&
       (ora - tempoPressione) >= PRESSIONE_LUNGA) {
     inRampa = true;
     click = 0;
-    if (stato.luminosita >= LUM_MAX) direzioneRampa = -1;
-    else if (stato.luminosita <= LUM_MIN) direzioneRampa = 1;
+    if (lum >= LUM_MAX) direzioneRampa = -1;
+    else if (lum <= LUM_MIN) direzioneRampa = 1;
     ultimoPassoRampa = ora;
   }
 
   if (inRampa) {
     while ((ora - ultimoPassoRampa) >= PASSO_RAMPA) {
       ultimoPassoRampa += PASSO_RAMPA;
-      int16_t nuovo = (int16_t)stato.luminosita + direzioneRampa;
+      int16_t nuovo = (int16_t)lum + direzioneRampa;
       if (nuovo >= LUM_MIN && nuovo <= LUM_MAX) {
-        stato.luminosita = (uint8_t)nuovo;
+        lum = (uint8_t)nuovo;
         segnaModifica(ora);
       }
     }
@@ -238,16 +281,16 @@ void gestisciPulsante(unsigned long ora) {
 void setup() {
   // Uscite basse = MOSFET spenti (le resistenze sulle basi le tengono
   // spente anche mentre l'Arduino si avvia).
-  digitalWrite(PIN_CANALE_A, LOW);
-  digitalWrite(PIN_CANALE_B, LOW);
-  digitalWrite(PIN_SPIA, LOW);
-  pinMode(PIN_CANALE_A, OUTPUT);
-  pinMode(PIN_CANALE_B, OUTPUT);
-  pinMode(PIN_SPIA, OUTPUT);
+  const uint8_t uscite[] = { PIN_DRL, PIN_ANAB, PIN_ABB, PIN_SPIA };
+  for (uint8_t p : uscite) {
+    digitalWrite(p, LOW);
+    pinMode(p, OUTPUT);
+  }
   pinMode(PIN_PULSANTE, INPUT_PULLUP);
+  pinMode(PIN_ABB_MOTO, INPUT_PULLUP);
 
   caricaStato();
-  if (!RIPRISTINA_STROBO) stato.modalita = FISSO;
+  if (!RIPRISTINA_STROBO) stato.strobo = 0;
 
   delay(RITARDO_AVVIO);           // lascia passare l'avviamento del motore
   avviaLuce(millis());
@@ -256,6 +299,7 @@ void setup() {
 void loop() {
   unsigned long ora = millis();
   gestisciPulsante(ora);
+  gestisciAbbMoto(ora);
 
   if (statoCambiato() && (ora - ultimoCambio) >= RITARDO_SALVA && !inRampa) {
     salvaStato();
